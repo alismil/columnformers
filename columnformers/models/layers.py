@@ -2,8 +2,16 @@ from typing import Callable, List
 
 import torch
 import torch.nn.functional as F
+import torch.nn.utils.prune as prune
 from timm.layers import trunc_normal_
 from torch import nn
+
+try:
+    from triton.ops.blocksparse import matmul as blocksparse_matmul  # noqa
+
+    triton_available = True
+except ImportError:
+    triton_available = False
 
 Layer = Callable[..., nn.Module]
 
@@ -60,17 +68,17 @@ class MixtureLinear(nn.Module):
         self,
         in_features: int,
         out_features: int,
-        coef: "MixtureCoefficients",
+        rank: int = 16,
         bias: bool = True,
     ):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
-        self.coef = coef
+        self.rank = rank
 
-        self.weight = nn.Parameter(torch.empty((out_features, in_features, coef.rank)))
+        self.weight = nn.Parameter(torch.empty((out_features, in_features, rank)))
         if bias:
-            self.bias = nn.Parameter(torch.empty(out_features, coef.rank))
+            self.bias = nn.Parameter(torch.empty(out_features, rank))
         else:
             self.register_parameter("bias", None)
         self.reset_parameters()
@@ -80,10 +88,9 @@ class MixtureLinear(nn.Module):
         if self.bias is not None:
             nn.init.zeros_(self.bias)
 
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
+    def forward(self, input: torch.Tensor, coef: torch.Tensor) -> torch.Tensor:
         # input: (B, N, C)
         # coef: (N, R)
-        coef = self.coef()
         # Nb, this implementation for some reason uses significantly fewer flops
         # compared to equivalent alternatives (e.g. einsum) for some reason.
         weight = (coef @ self.weight.transpose(1, 2)).transpose(0, 1)
@@ -95,7 +102,10 @@ class MixtureLinear(nn.Module):
         return output
 
     def extra_repr(self) -> str:
-        return f"{self.in_features}, {self.out_features}, bias={self.bias is not None}"
+        return (
+            f"{self.in_features}, {self.out_features}, {self.rank}, "
+            f"bias={self.bias is not None}"
+        )
 
 
 class MixtureCoefficients(nn.Module):
@@ -191,52 +201,6 @@ class UntiedLayerNorm(nn.Module):
         )
 
 
-class MixtureLayerNorm(nn.Module):
-    def __init__(
-        self,
-        dim: int,
-        coef: "MixtureCoefficients",
-        eps: float = 1e-5,
-        elementwise_affine: bool = True,
-    ):
-        super().__init__()
-        self.dim = dim
-        self.eps = eps
-        self.elementwise_affine = elementwise_affine
-        self.coef = coef
-
-        if self.elementwise_affine:
-            self.weight = nn.Parameter(torch.empty(dim, coef.rank))
-            self.bias = nn.Parameter(torch.empty(dim, coef.rank))
-        else:
-            self.register_parameter("weight", None)
-            self.register_parameter("bias", None)
-        self.reset_parameters()
-
-    def reset_parameters(self) -> None:
-        if self.elementwise_affine:
-            nn.init.ones_(self.weight)
-            nn.init.zeros_(self.bias)
-
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
-        input = F.layer_norm(input, (self.dim,), eps=self.eps)
-        if self.elementwise_affine:
-            coef = self.coef()
-            weight = coef @ self.weight.t()
-            bias = coef @ self.bias.t()
-            input = input * weight + bias
-        return input
-
-    def no_weight_decay(self) -> List[str]:
-        # Nb, not excluded by default since 2d
-        return ["weight", "bias"]
-
-    def extra_repr(self) -> str:
-        return (
-            f"{self.dim}, eps={self.eps}, elementwise_affine={self.elementwise_affine}"
-        )
-
-
 class SpatialPool(nn.Module):
     """
     Pool a sequence of features with a learned attention weight per class.
@@ -280,3 +244,97 @@ def init_weights(module: nn.Module):
             nn.init.zeros_(module.bias)
     elif hasattr(module, "init_weights"):
         module.init_weights()
+
+
+class BlockSparseLinear(nn.Module):
+    """
+    A linear layer with block sparse connectivity.
+
+    Args:
+        connectivity: a binary tensor of shape (out_features, in_features) representing
+            the connectivity between input and output units.
+        bias: use bias
+        blocksize: sparse block size, e.g. 16, 32. Must divide each dimension of
+            connectivity
+    """
+
+    def __init__(
+        self, connectivity: torch.Tensor, bias: bool = True, blocksize: int = 16
+    ):
+        assert triton_available, "blocksparse linear requires triton"
+        super().__init__()
+        self.in_features = connectivity.shape[0]
+        self.out_features = connectivity.shape[1]
+        self.blocksize = blocksize
+        self.connectivity = connectivity
+
+        self.linear = nn.Linear(self.in_features, self.out_features, bias=False).to(
+            self.connectivity.device
+        )
+
+        if bias:
+            self.bias = nn.Parameter(torch.empty(self.out_features))
+        else:
+            self.register_parameter("bias", None)
+
+        self.reset_parameters()
+
+        prune.custom_from_mask(self.linear, name="weight", mask=connectivity)
+
+        # convert to torch blocksparse representation if not already
+        sparse_connectivity = connectivity.to_sparse_bsr(blocksize)
+
+        # block sparse layout as expected by triton
+        # shape (1, out_features // block, in_features // block)
+        # must be dtype int64
+        layout = torch.sparse_csr_tensor(
+            sparse_connectivity.crow_indices(),
+            sparse_connectivity.col_indices(),
+            torch.ones_like(sparse_connectivity.col_indices()),
+        )
+        layout = layout.to_dense().unsqueeze(0)
+
+        self.sparse_dot_dds = blocksparse_matmul(
+            layout,
+            blocksize,
+            "dds",
+            trans_a=False,
+            trans_b=False,
+            device=self.connectivity.device,
+        )
+
+    def reset_parameters(self):
+        # TODO: decide how to best init the weights
+        nn.init.xavier_normal_(self.linear.weight)
+        if self.bias is not None:
+            nn.init.zeros_(self.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch = x.shape[0]
+
+        weight = self.linear.weight
+        sparse_weight = weight.to_sparse_bsr(self.blocksize).values()
+        sparse_weight = sparse_weight.unsqueeze(0).repeat(batch, 1, 1, 1)
+
+        x = self.sparse_dot_dds(x.to(torch.float16), sparse_weight.to(torch.float16))
+
+        if self.bias is not None:
+            x += self.bias
+
+        return x
+
+    def extra_repr(self) -> str:
+        return (
+            f"{self.in_features}, {self.out_features}, "
+            f"bias={self.bias is not None}, blocksize={self.blocksize}"
+        )
+
+
+class BlockSparseLocallyConnected(nn.Module):
+    """
+    A locally connected layer implemented using block sparse linear.
+
+    TODO: main step is just computing the connectivity based on conv params. shape
+    should be something like: (out_height * out_width * out_channels, in_height *
+    in_width * in_channels). Then we just use BlockSparseLinear.
+    """
